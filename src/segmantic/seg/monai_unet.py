@@ -19,7 +19,7 @@ from monai.inferers import SlidingWindowInferer, sliding_window_inference
 from monai.losses import DiceLoss
 from monai.metrics import ConfusionMatrixMetric, CumulativeAverage, DiceMetric
 from monai.networks.layers import Norm
-from monai.networks.nets import UNet
+from monai.networks.nets import AttentionUnet, UNet
 from monai.networks.utils import one_hot
 from monai.transforms import (
     AsDiscrete,
@@ -100,7 +100,7 @@ class Net(pl.LightningModule):
         super().__init__()
 
         self.save_hyperparameters()
-
+        # """
         self._model = UNet(
             spatial_dims=spatial_dims,
             in_channels=num_channels,
@@ -111,6 +111,17 @@ class Net(pl.LightningModule):
             num_res_units=2,
             norm=Norm.BATCH,
         )
+        """
+        print('attention UNet')
+        self._model = AttentionUnet(
+            spatial_dims=spatial_dims,
+            in_channels=num_channels,
+            out_channels=num_classes,
+            channels=channels,
+            strides=strides,
+            dropout=dropout,
+        )
+        """
         # ToDo: make true/false dependant on if optimizer is default or not
         self.automatic_optimization = False
         self.spatial_size = spatial_size if spatial_size else [96] * 3
@@ -139,13 +150,15 @@ class Net(pl.LightningModule):
         keys: List[str],
         spacing: Sequence[float] = [],
     ) -> Transform:
-
+        print("Normalize Intensity: on")
         xforms = [
             LoadImaged(keys=keys, reader="ITKReader"),
             EnsureChannelFirstd(keys=keys),
             Orientationd(keys=keys, axcodes="RAS"),
             NormalizeIntensityd(keys="image", nonzero=False, channel_wise=True),
-            CropForegroundd(keys=keys, source_key="label"),
+            CropForegroundd(
+                keys=keys, source_key="label" if "label" in keys else "image"
+            ),
             EnsureTyped(keys=keys, dtype=np.float32, device=torch.device(self.device)),
         ]
 
