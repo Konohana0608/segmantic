@@ -115,6 +115,10 @@ class Net(pl.LightningModule):
         self.automatic_optimization = False
         self.spatial_size = spatial_size if spatial_size else [96] * 3
         self.loss_function = DiceLoss(to_onehot_y=True, softmax=True)
+        self.loss_function_mod = DiceLoss(
+            to_onehot_y=True, softmax=True, reduction="none"
+        )
+        self.loss_scaling = torch.tensor([1, 1, 5, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 5, 1])
         self.post_pred = Compose(
             [
                 EnsureType(),
@@ -169,6 +173,11 @@ class Net(pl.LightningModule):
                 RandZoomd(keys=keys, prob=0.2, min_zoom=0.8, max_zoom=1.3, mode=mode)
             )
         # Set probability of background label being chosen as corp center to 0 and rest to 1.
+        print("PROBABILITIES FOR CHOOSING TISSUE: ")
+        print([0, 1, 5, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 10, 1])
+        # print([0, 1, 10, 1, 1, 1, 5, 1, 10, 5, 10, 1, 5, 5, 1])
+        # print([0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1])
+        print(self.num_samples)
         xforms += [
             RandCropByLabelClassesd(
                 keys=keys,
@@ -176,7 +185,8 @@ class Net(pl.LightningModule):
                 spatial_size=self.spatial_size,
                 num_classes=self.num_classes,
                 num_samples=self.num_samples,
-                ratios=[0 if x == 0 else 1 for x in range(self.num_classes)],
+                ratios=[0, 1, 5, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 10, 1],
+                # ratios=[0 if x == 0 else 1 for x in range(self.num_classes)],
             )
         ]
 
@@ -321,10 +331,17 @@ class Net(pl.LightningModule):
         output = self.forward(images)
         optimizer = self.optimizers()
         optimizer.zero_grad()
+
         loss = self.loss_function(output, labels)
-        self.manual_backward(loss)
+        loss2 = self.loss_function_mod(output, labels)
+
+        for i in range(loss2.size()[0]):
+            self.loss_scaling = self.loss_scaling.to(device=torch.device(self.device))
+            loss2[i, :, 0, 0, 0] = self.loss_scaling * loss2[i, :, 0, 0, 0]
+
+        self.manual_backward(torch.mean(loss2))
         optimizer.step()
-        tensorboard_logs = {"train_loss": loss.item()}
+        tensorboard_logs = {"train_loss": torch.mean(loss2).item()}
         return {"loss": loss, "log": tensorboard_logs}
 
     def validation_step(self, batch, batch_idx):
@@ -334,7 +351,9 @@ class Net(pl.LightningModule):
         outputs = sliding_window_inference(
             images, roi_size, sw_batch_size, self.forward
         )
+
         loss = self.loss_function(outputs, labels)
+
         outputs = [self.post_pred(i) for i in decollate_batch(outputs)]
         labels = [self.post_label(i) for i in decollate_batch(labels)]
         self.dice_metric(y_pred=outputs, y=labels)
