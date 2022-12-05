@@ -43,14 +43,14 @@ torchvision==0.12.0+cu113
 Run training:
 
 ```sh
-python src/segmantic/scripts/run_monai_unet.py train --help
-python src/segmantic/scripts/run_monai_unet.py train -i work/inputs/images -l work/inputs/labels -t work/inputs/labels.txt -r work/outputs
+segmantic-unet train --help
+segmantic-unet train -i work/inputs/images -l work/inputs/labels -t work/inputs/labels.txt -r work/outputs
 ```
 
 Or with a config file - first create empty config file (yml or json format):
 
 ```sh
-python scripts\run_monai_unet.py train-config -c config.yml --print-defaults
+segmantic-unet train-config -c config.yml --print-defaults
 ```
 
 Edit `config.yml` e.g. to
@@ -75,7 +75,7 @@ gpu_ids:
 Now run training:
 
 ```sh
-python scripts\run_monai_unet.py train-config -c config.yml
+segmantic-unet train-config -c config.yml
 ```
 
 ## What is this tisse_list?
@@ -96,9 +96,9 @@ Instead of providing the 'image_dir'/'labels_dir' pair, the training data can al
 
 ```json
 {
-    "dataset" = ["/dataA/dataset.json", "/dataB/dataset.json"],
-    "output_dir" = "<path where trained model and logs are saved>",
-    ...
+    "dataset": ["/dataA/dataset.json", "/dataB/dataset.json"],
+    "output_dir": "<path where trained model and logs are saved>",
+    "Etc": "etc"
 }
 ```
 

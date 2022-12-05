@@ -6,7 +6,7 @@ from typing import Dict, List, Sequence, Union
 import numpy as np
 from sklearn.model_selection import KFold
 
-from ..util.json import PathEncoder
+from ..utils.json import PathEncoder
 
 
 def find_matching_files(input_globs: List[Path], verbose: bool = True):
@@ -59,7 +59,7 @@ def create_data_dict(
     return data_dicts
 
 
-class PairedDataSet(object):
+class PairedDataSet:
     def __init__(
         self,
         image_dir: Path = Path(),
