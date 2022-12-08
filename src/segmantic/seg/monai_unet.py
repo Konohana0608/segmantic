@@ -4,7 +4,7 @@ import subprocess as sp
 import sys
 from functools import partial
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple, Union, cast
+from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union, cast
 
 import numpy as np
 import pytorch_lightning as pl
@@ -24,7 +24,12 @@ from monai.engines import EnsembleEvaluator
 # from monai.handlers import MeanDice, from_engine
 from monai.inferers import SlidingWindowInferer, sliding_window_inference
 from monai.losses import DiceLoss
-from monai.metrics import ConfusionMatrixMetric, CumulativeAverage, DiceMetric
+from monai.metrics import (
+    ConfusionMatrixMetric,
+    CumulativeAverage,
+    DiceMetric,
+    compute_hausdorff_distance,
+)
 from monai.networks.layers import Norm
 from monai.networks.nets import UNet
 from monai.networks.utils import one_hot
@@ -62,6 +67,8 @@ from pytorch_lightning.callbacks import (
     ModelCheckpoint,
 )
 from pytorch_lightning.loggers import TensorBoardLogger
+from scipy.ndimage import distance_transform_edt as eucl_distance
+from torch import einsum
 
 from ..image.labels import load_tissue_list
 from ..seg.enum import EnsembleCombination
@@ -71,6 +78,87 @@ from .dataset import PairedDataSet
 from .evaluation import confusion_matrix
 from .utils import make_device
 from .visualization import plot_confusion_matrix
+
+
+def uniq(a: torch.Tensor) -> Set:
+    return set(torch.unique(a.cpu()).numpy())
+
+
+def sset(a: torch.Tensor, sub: Iterable) -> bool:
+    return uniq(a).issubset(sub)
+
+
+def eq(a: torch.Tensor, b) -> bool:
+    return torch.eq(a, b).all()
+
+
+def simplex(t: torch.Tensor, axis=1) -> bool:
+    _sum = cast(torch.Tensor, t.sum(axis).type(torch.float32))
+    _ones = torch.ones_like(_sum, dtype=torch.float32)
+    return torch.allclose(_sum, _ones)
+
+
+def s_one_hot(t: torch.Tensor, axis=1) -> bool:
+    return simplex(t, axis) and sset(t, [0, 1])
+
+
+def probs2class(probs: torch.Tensor) -> torch.Tensor:
+    b, _, *img_shape = probs.shape
+
+    res = probs.argmax(dim=1)
+    assert res.shape == (b, *img_shape)
+
+    return res
+
+
+def class2one_hot(seg: torch.Tensor, K: int) -> torch.Tensor:
+    # Breaking change but otherwise can't deal with both 2d and 3d
+    # if len(seg.shape) == 3:  # Only w, h, d, used by the dataloader
+    #     return class2one_hot(seg.unsqueeze(dim=0), K)[0]
+
+    b, *img_shape = seg.shape  # type: Tuple[int, ...]
+
+    device = seg.device
+    res = torch.zeros((b, K, *img_shape), dtype=torch.int32, device=device).scatter_(
+        1, seg[:, None, ...], 1
+    )
+
+    assert res.shape == (b, K, *img_shape)
+    assert s_one_hot(res)
+
+    return res
+
+
+def probs2one_hot(probs: torch.Tensor) -> torch.Tensor:
+    _, K, *_ = probs.shape
+
+    res = class2one_hot(probs2class(probs), K)
+    assert res.shape == probs.shape
+    assert s_one_hot(res)
+
+    return res
+
+
+def one_hot2hd_dist(
+    seg: np.ndarray, resolution: Tuple[float, float, float] = None, dtype=None
+) -> np.ndarray:
+    """
+    Used for https://arxiv.org/pdf/1904.10030.pdf,
+    implementation from https://github.com/JunMa11/SegWithDistMap
+    """
+    # Relasx the assertion to allow computation live on only a
+    # subset of the classes
+    # assert one_hot(torch.tensor(seg), axis=0)
+    K: int = len(seg)
+
+    res = np.zeros_like(seg, dtype=dtype)
+    for k in range(K):
+        posmask = seg[k].astype(np.bool)
+
+        if posmask.any():
+            res[k] = eucl_distance(posmask, sampling=resolution)
+
+    return res
 
 
 class Net(pl.LightningModule):
@@ -186,9 +274,9 @@ class Net(pl.LightningModule):
             )
         # Set probability of background label being chosen as corp center to 0 and rest to 1.
         print("PROBABILITIES FOR CHOOSING TISSUE: ")
-        print([0, 1, 5, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 10, 1])
+        # print([0, 1, 5, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 10, 1])
         # print([0, 1, 10, 1, 1, 1, 5, 1, 10, 5, 10, 1, 5, 5, 1])
-        # print([0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1])
+        print([0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1])
         print(self.num_samples)
         xforms += [
             RandCropByLabelClassesd(
@@ -197,8 +285,8 @@ class Net(pl.LightningModule):
                 spatial_size=self.spatial_size,
                 num_classes=self.num_classes,
                 num_samples=self.num_samples,
-                ratios=[0, 1, 5, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 10, 1],
-                # ratios=[0 if x == 0 else 1 for x in range(self.num_classes)],
+                # ratios=[0, 1, 5, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 10, 1],
+                ratios=[0 if x == 0 else 1 for x in range(self.num_classes)],
             )
         ]
 
@@ -337,6 +425,9 @@ class Net(pl.LightningModule):
         return [optimizer], [lr_scheduler]
 
     def training_step(self, batch, batch_idx):
+        import time
+
+        start = time.time()
         images, labels = batch["image"], batch["label"]
         output = self.forward(images)
         optimizer = self.optimizers()
@@ -348,10 +439,70 @@ class Net(pl.LightningModule):
         for i in range(loss2.size()[0]):
             self.loss_scaling = self.loss_scaling.to(device=torch.device(self.device))
             loss2[i, :, 0, 0, 0] = self.loss_scaling * loss2[i, :, 0, 0, 0]
+        labels = one_hot(labels, num_classes=self._model.out_channels, dim=1)
+        assert output.shape == labels.shape
 
-        self.manual_backward(torch.mean(loss2))
+        B, K, *xyz = output.shape  # type: ignore
+
+        pc = cast(torch.Tensor, output.type(torch.float32))
+        tc = cast(torch.Tensor, labels.type(torch.float32))
+        # assert pc.shape == tc.shape == (B, len(self.idc), *xyz)
+
+        target_dm_npy: np.ndarray = np.stack(
+            [one_hot2hd_dist(tc[b].cpu().detach().numpy()) for b in range(B)], axis=0
+        )
+        assert target_dm_npy.shape == tc.shape == pc.shape
+        tdm: torch.Tensor = torch.tensor(
+            target_dm_npy, device=output.device, dtype=torch.float32
+        )
+
+        pred_segmentation: torch.Tensor = probs2one_hot(output).cpu().detach()
+        pred_dm_npy: np.nparray = np.stack(
+            [
+                one_hot2hd_dist(pred_segmentation[b, :, :, :, :].numpy())
+                for b in range(B)
+            ],
+            axis=0,
+        )
+        assert pred_dm_npy.shape == tc.shape == pc.shape
+        pdm: torch.Tensor = torch.tensor(
+            pred_dm_npy, device=output.device, dtype=torch.float32
+        )
+
+        delta = (pc - tc) ** 2
+        dtm = tdm**2 + pdm**2
+        print(pc.size())
+        print(tc.size())
+        print(delta.size())
+        print(tdm.size())
+        print(pdm.size())
+        print(dtm.size())
+        print(time.time() - start)
+
+        multipled = einsum("bckwh,bckwh->bckwh", delta, dtm)
+
+        loss = multipled.mean()
+        print(loss)
+
+        hausdorff_metric = compute_hausdorff_distance(
+            y_pred=output,
+            y=labels,
+            include_background=False,
+            distance_metric="euclidean",
+            percentile=None,
+            directed=False,
+        )
+
+        hausdorff_np = hausdorff_metric.numpy()
+        mean = np.mean(hausdorff_np[np.isfinite(hausdorff_np)])
+        print(mean)
+
+        # self.manual_backward(torch.mean(loss2))
+        self.manual_backward(loss)
         optimizer.step()
         tensorboard_logs = {"train_loss": torch.mean(loss2).item()}
+        tensorboard_logs = {"train_loss": loss.item()}
+        print(time.time() - start)
         return {"loss": loss, "log": tensorboard_logs}
 
     def validation_step(self, batch, batch_idx):
@@ -769,6 +920,7 @@ def cross_validate(
 
         assert config_file.suffix in [".json", ".yaml"]
         is_json = config_file and config_file.suffix.lower() == ".json"
+        print(is_json)
         dumps = partial(config.dumps, is_json)
         loads = partial(config.loads, is_json)
 
@@ -781,8 +933,11 @@ def cross_validate(
             print(current_output)
 
             current_output.mkdir(exist_ok=True)
-
+            print(config_file)
+            print(type(config_file))
             data: dict = loads(config_file.read_text())
+
+            print(data)
 
             data["dataset"] = str(dataset_path)
             data["output_dir"] = str(current_output)
